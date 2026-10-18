@@ -9,13 +9,26 @@
 
 #include <wayland-client.h>
 #include <wayland-cursor.h>
-#include <xkbcommon/xkbcommon-compose.h>
-#include <xkbcommon/xkbcommon.h>
 
 #include "relative-pointer-unstable-v1-client-protocol.h"
+#include "viewporter-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
 #include "steam_overlay_bridge.h"
 
 #define GE_WHEEL_DELTA 120
+#define GE_MAX_OUTPUTS 8
+
+struct overlay_output
+{
+    struct wl_output *output;
+    struct zxdg_output_v1 *xdg_output;
+    uint32_t name;
+    int mode_width;
+    int mode_height;
+    int scale;
+    int logical_width;
+    int logical_height;
+};
 
 struct ge_overlay_wayland_surface
 {
@@ -37,11 +50,20 @@ struct ge_overlay_wayland_surface
     struct wl_surface *cursor_surface;
     struct wl_surface *overlay_cursor_surface;
     struct wl_subsurface *overlay_cursor_subsurface;
-    struct xkb_context *xkb_context;
-    struct xkb_keymap *xkb_keymap;
-    struct xkb_state *xkb_state;
-    struct xkb_compose_table *xkb_compose_table;
-    struct xkb_compose_state *xkb_compose_state;
+    struct zxdg_output_manager_v1 *xdg_output_manager;
+    struct wp_viewporter *viewporter;
+    struct overlay_output outputs[GE_MAX_OUTPUTS];
+    /* While the overlay is open, a transparent subsurface covering the game
+     * window takes pointer focus away from the game's own surface, so the
+     * game stops receiving the mouse input Steam is using. */
+    struct wl_surface *catcher_surface;
+    struct wl_subsurface *catcher_subsurface;
+    struct wp_viewport *catcher_viewport;
+    struct overlay_output *catcher_output;
+    int catcher_width;
+    int catcher_height;
+    int on_catcher;
+    uint32_t xdg_output_manager_name;
     uint32_t seat_name;
     uint32_t subcompositor_name;
     uint32_t relative_pointer_manager_name;
@@ -62,11 +84,16 @@ struct ge_overlay_wayland_surface
 };
 
 static pthread_mutex_t input_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t input_dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct ge_overlay_wayland_surface *process_input_surface;
 static pthread_mutex_t focused_pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct ge_overlay_wayland_surface *focused_pointer;
 static uint32_t requested_cursor_shape = GE_STEAM_OVERLAY_CURSOR_DEFAULT;
 static int requested_overlay_active;
+static struct ge_overlay_wayland_surface *active_input;
+/* Swapchain size in pixels: the coordinate space Steam renders and hit-tests in. */
+static volatile int swapchain_width;
+static volatile int swapchain_height;
 
 static int overlay_debug_enabled(void)
 {
@@ -265,6 +292,324 @@ static void apply_overlay_cursor_shape(
     wl_display_flush(surface->display);
 }
 
+static void output_geometry(void *data, struct wl_output *wl_output, int32_t x,
+                            int32_t y, int32_t pw, int32_t ph,
+                            int32_t subpixel, const char *make,
+                            const char *model, int32_t transform)
+{
+    (void)data; (void)wl_output; (void)x; (void)y; (void)pw; (void)ph;
+    (void)subpixel; (void)make; (void)model; (void)transform;
+}
+
+static void output_mode(void *data, struct wl_output *wl_output, uint32_t flags,
+                        int32_t width, int32_t height, int32_t refresh)
+{
+    struct overlay_output *output = data;
+
+    (void)wl_output; (void)refresh;
+    if (!(flags & WL_OUTPUT_MODE_CURRENT)) return;
+    output->mode_width = width;
+    output->mode_height = height;
+}
+
+static void output_done(void *data, struct wl_output *wl_output)
+{
+    (void)data; (void)wl_output;
+}
+
+static void output_scale(void *data, struct wl_output *wl_output, int32_t scale)
+{
+    struct overlay_output *output = data;
+
+    (void)wl_output;
+    output->scale = scale;
+}
+
+static const struct wl_output_listener output_listener =
+{
+    .geometry = output_geometry,
+    .mode = output_mode,
+    .done = output_done,
+    .scale = output_scale,
+};
+
+static void xdg_output_logical_position(void *data,
+                                        struct zxdg_output_v1 *xdg_output,
+                                        int32_t x, int32_t y)
+{
+    (void)data; (void)xdg_output; (void)x; (void)y;
+}
+
+static void xdg_output_logical_size(void *data,
+                                    struct zxdg_output_v1 *xdg_output,
+                                    int32_t width, int32_t height)
+{
+    struct overlay_output *output = data;
+
+    (void)xdg_output;
+    output->logical_width = width;
+    output->logical_height = height;
+}
+
+static void xdg_output_done(void *data, struct zxdg_output_v1 *xdg_output)
+{
+    (void)data; (void)xdg_output;
+}
+
+static void xdg_output_name(void *data, struct zxdg_output_v1 *xdg_output,
+                            const char *name)
+{
+    (void)data; (void)xdg_output; (void)name;
+}
+
+static void xdg_output_description(void *data,
+                                   struct zxdg_output_v1 *xdg_output,
+                                   const char *description)
+{
+    (void)data; (void)xdg_output; (void)description;
+}
+
+static const struct zxdg_output_v1_listener xdg_output_listener =
+{
+    .logical_position = xdg_output_logical_position,
+    .logical_size = xdg_output_logical_size,
+    .done = xdg_output_done,
+    .name = xdg_output_name,
+    .description = xdg_output_description,
+};
+
+static void attach_xdg_outputs(struct ge_overlay_wayland_surface *surface)
+{
+    int i;
+
+    if (!surface->xdg_output_manager) return;
+    for (i = 0; i < GE_MAX_OUTPUTS; ++i)
+    {
+        struct overlay_output *output = &surface->outputs[i];
+
+        if (!output->output || output->xdg_output) continue;
+        output->xdg_output = zxdg_output_manager_v1_get_xdg_output(
+            surface->xdg_output_manager, output->output);
+        if (output->xdg_output)
+            zxdg_output_v1_add_listener(output->xdg_output,
+                                        &xdg_output_listener, output);
+    }
+}
+
+static void destroy_output(struct ge_overlay_wayland_surface *surface,
+                           struct overlay_output *output)
+{
+    if (surface->catcher_output == output) surface->catcher_output = NULL;
+    if (output->xdg_output) zxdg_output_v1_destroy(output->xdg_output);
+    if (output->output) wl_output_destroy(output->output);
+    memset(output, 0, sizeof(*output));
+}
+
+static void destroy_outputs(struct ge_overlay_wayland_surface *surface)
+{
+    int i;
+
+    for (i = 0; i < GE_MAX_OUTPUTS; ++i)
+        if (surface->outputs[i].output)
+            destroy_output(surface, &surface->outputs[i]);
+}
+
+/* Logical (compositor coordinate) size of the output the game is shown on. */
+static int output_logical_size(const struct overlay_output *output,
+                               int *width, int *height)
+{
+    int scale = output->scale > 0 ? output->scale : 1;
+
+    if (output->logical_width > 0 && output->logical_height > 0)
+    {
+        *width = output->logical_width;
+        *height = output->logical_height;
+        return 1;
+    }
+    if (output->mode_width > 0 && output->mode_height > 0)
+    {
+        *width = output->mode_width / scale;
+        *height = output->mode_height / scale;
+        return 1;
+    }
+    return 0;
+}
+
+static int catcher_target_size(struct ge_overlay_wayland_surface *surface,
+                               int *width, int *height)
+{
+    int i;
+
+    if (surface->catcher_output &&
+        output_logical_size(surface->catcher_output, width, height))
+        return 1;
+    for (i = 0; i < GE_MAX_OUTPUTS; ++i)
+        if (surface->outputs[i].output &&
+            output_logical_size(&surface->outputs[i], width, height))
+            return 1;
+    return 0;
+}
+
+/* Pointer position in surface-local compositor units -> Steam's pixels. */
+static void pointer_to_steam(struct ge_overlay_wayland_surface *surface,
+                             double fx, double fy, int32_t *x, int32_t *y)
+{
+    int sw = swapchain_width, sh = swapchain_height;
+
+    if (surface->on_catcher && surface->catcher_width > 0 &&
+        surface->catcher_height > 0 && sw > 0 && sh > 0)
+    {
+        fx = fx * sw / surface->catcher_width;
+        fy = fy * sh / surface->catcher_height;
+        if (fx > sw - 1) fx = sw - 1;
+        if (fy > sh - 1) fy = sh - 1;
+        if (fx < 0) fx = 0;
+        if (fy < 0) fy = 0;
+    }
+    *x = (int32_t)fx;
+    *y = (int32_t)fy;
+}
+
+static void catcher_surface_enter(void *data, struct wl_surface *wl_surface,
+                                  struct wl_output *wl_output)
+{
+    struct ge_overlay_wayland_surface *surface = data;
+    int i, width, height;
+
+    (void)wl_surface;
+    pthread_mutex_lock(&focused_pointer_mutex);
+    if (!surface->catcher_surface) goto out;
+    for (i = 0; i < GE_MAX_OUTPUTS; ++i)
+        if (surface->outputs[i].output == wl_output)
+        {
+            surface->catcher_output = &surface->outputs[i];
+            break;
+        }
+    if (surface->catcher_viewport && catcher_target_size(surface, &width, &height) &&
+        (width != surface->catcher_width || height != surface->catcher_height))
+    {
+        surface->catcher_width = width;
+        surface->catcher_height = height;
+        wp_viewport_set_destination(surface->catcher_viewport, width, height);
+        wl_surface_commit(surface->catcher_surface);
+    }
+out:
+    pthread_mutex_unlock(&focused_pointer_mutex);
+}
+
+static void catcher_surface_leave(void *data, struct wl_surface *wl_surface,
+                                  struct wl_output *wl_output)
+{
+    (void)data; (void)wl_surface; (void)wl_output;
+}
+
+static const struct wl_surface_listener catcher_surface_listener =
+{
+    .enter = catcher_surface_enter,
+    .leave = catcher_surface_leave,
+};
+
+static struct wl_buffer *create_transparent_buffer(
+    struct ge_overlay_wayland_surface *surface)
+{
+    struct wl_shm_pool *pool;
+    struct wl_buffer *buffer;
+    int fd;
+
+    if ((fd = memfd_create("steam-overlay-input", MFD_CLOEXEC)) < 0)
+        return NULL;
+    if (ftruncate(fd, 4) < 0)
+    {
+        close(fd);
+        return NULL;
+    }
+    pool = wl_shm_create_pool(surface->shm, fd, 4);
+    close(fd);
+    if (!pool) return NULL;
+    buffer = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4,
+                                       WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    return buffer;
+}
+
+static void destroy_input_catcher_locked(
+    struct ge_overlay_wayland_surface *surface)
+{
+    if (surface->catcher_viewport)
+        wp_viewport_destroy(surface->catcher_viewport);
+    if (surface->catcher_subsurface)
+        wl_subsurface_destroy(surface->catcher_subsurface);
+    if (surface->catcher_surface) wl_surface_destroy(surface->catcher_surface);
+    surface->catcher_viewport = NULL;
+    surface->catcher_subsurface = NULL;
+    surface->catcher_surface = NULL;
+    surface->catcher_output = NULL;
+    surface->catcher_width = 0;
+    surface->catcher_height = 0;
+    if (surface->on_catcher)
+    {
+        /* The compositor's leave event for a destroyed surface is dropped. */
+        surface->on_catcher = 0;
+        surface->pointer_surface = NULL;
+        surface->pointer_focus = 0;
+        surface->pointer_serial = 0;
+        surface->relative_motion_seen = 0;
+        memset(&surface->frame, 0, sizeof(surface->frame));
+        if (focused_pointer == surface) focused_pointer = NULL;
+        destroy_overlay_cursor(surface);
+    }
+    if (surface->display) wl_display_flush(surface->display);
+}
+
+static void create_input_catcher_locked(
+    struct ge_overlay_wayland_surface *surface)
+{
+    struct wl_buffer *buffer;
+    int width, height;
+
+    if (surface->catcher_surface || !surface->target_surface ||
+        !surface->compositor || !surface->subcompositor ||
+        !surface->viewporter || !surface->shm ||
+        !catcher_target_size(surface, &width, &height))
+        return;
+
+    surface->catcher_surface = wl_compositor_create_surface(surface->compositor);
+    if (!surface->catcher_surface) return;
+    wl_surface_add_listener(surface->catcher_surface,
+                            &catcher_surface_listener, surface);
+    surface->catcher_subsurface = wl_subcompositor_get_subsurface(
+        surface->subcompositor, surface->catcher_surface,
+        surface->target_surface);
+    surface->catcher_viewport = wp_viewporter_get_viewport(
+        surface->viewporter, surface->catcher_surface);
+    buffer = create_transparent_buffer(surface);
+    if (!surface->catcher_subsurface || !surface->catcher_viewport || !buffer)
+    {
+        if (buffer) wl_buffer_destroy(buffer);
+        destroy_input_catcher_locked(surface);
+        return;
+    }
+
+    surface->catcher_width = width;
+    surface->catcher_height = height;
+    wl_subsurface_set_desync(surface->catcher_subsurface);
+    wl_subsurface_place_above(surface->catcher_subsurface,
+                              surface->target_surface);
+    wp_viewport_set_destination(surface->catcher_viewport, width, height);
+    wl_surface_attach(surface->catcher_surface, buffer, 0, 0);
+    wl_surface_damage(surface->catcher_surface, 0, 0, 1, 1);
+    wl_surface_commit(surface->catcher_surface);
+    wl_buffer_destroy(buffer);
+    wl_display_flush(surface->display);
+    overlay_trace("created pointer input catcher surface");
+}
+
+void ge_overlay_wayland_set_swapchain_extent(int32_t width, int32_t height)
+{
+    swapchain_width = width;
+    swapchain_height = height;
+}
+
 void ge_overlay_wayland_set_cursor_shape(uint32_t shape)
 {
     if (shape > GE_STEAM_OVERLAY_CURSOR_HELP)
@@ -282,6 +627,17 @@ void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y)
     pthread_mutex_lock(&focused_pointer_mutex);
     if (focused_pointer)
     {
+        int sw = swapchain_width, sh = swapchain_height;
+
+        /* Steam's pixels -> surface-local units, for the catcher and for
+         * the game surface alike (the visual cursor lives on the latter
+         * while the game holds a pointer lock). */
+        if (focused_pointer->catcher_width > 0 &&
+            focused_pointer->catcher_height > 0 && sw > 0 && sh > 0)
+        {
+            x = (int32_t)((int64_t)x * focused_pointer->catcher_width / sw);
+            y = (int32_t)((int64_t)y * focused_pointer->catcher_height / sh);
+        }
         focused_pointer->pointer_x = x;
         focused_pointer->pointer_y = y;
         if (focused_pointer->overlay_cursor_subsurface)
@@ -297,6 +653,13 @@ void ge_overlay_wayland_set_overlay_active(int active)
 {
     pthread_mutex_lock(&focused_pointer_mutex);
     requested_overlay_active = !!active;
+    if (active_input)
+    {
+        if (active)
+            create_input_catcher_locked(active_input);
+        else
+            destroy_input_catcher_locked(active_input);
+    }
     if (focused_pointer)
     {
         focused_pointer->overlay_cursor_active = requested_overlay_active;
@@ -315,117 +678,14 @@ void ge_overlay_wayland_set_overlay_active(int active)
 
 static void release_pressed_keys(struct ge_overlay_wayland_surface *surface);
 
-static void destroy_keyboard_state(struct ge_overlay_wayland_surface *surface)
-{
-    if (surface->xkb_compose_state)
-        xkb_compose_state_unref(surface->xkb_compose_state);
-    if (surface->xkb_compose_table)
-        xkb_compose_table_unref(surface->xkb_compose_table);
-    if (surface->xkb_state) xkb_state_unref(surface->xkb_state);
-    if (surface->xkb_keymap) xkb_keymap_unref(surface->xkb_keymap);
-    if (surface->xkb_context) xkb_context_unref(surface->xkb_context);
-
-    surface->xkb_compose_state = NULL;
-    surface->xkb_compose_table = NULL;
-    surface->xkb_state = NULL;
-    surface->xkb_keymap = NULL;
-    surface->xkb_context = NULL;
-}
-
-static const char *keyboard_locale(void)
-{
-    const char *locale;
-
-    if ((locale = getenv("LC_ALL")) && *locale) return locale;
-    if ((locale = getenv("LC_CTYPE")) && *locale) return locale;
-    if ((locale = getenv("LANG")) && *locale) return locale;
-    return "C";
-}
-
 static void keyboard_keymap(void *data, struct wl_keyboard *keyboard,
                             uint32_t format, int32_t fd, uint32_t size)
 {
-    struct ge_overlay_wayland_surface *surface = data;
-    struct xkb_compose_table *compose_table = NULL;
-    struct xkb_compose_state *compose_state = NULL;
-    struct xkb_context *context = NULL;
-    struct xkb_keymap *keymap = NULL;
-    struct xkb_state *state = NULL;
-    char *map;
-
+    (void)data;
     (void)keyboard;
-
-    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || !size) goto done;
-    if ((map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
-        goto done;
-
-    if (!(context = xkb_context_new(XKB_CONTEXT_NO_FLAGS))) goto unmap;
-    if (!(keymap = xkb_keymap_new_from_string(
-              context, map, XKB_KEYMAP_FORMAT_TEXT_V1,
-              XKB_KEYMAP_COMPILE_NO_FLAGS)))
-        goto unmap;
-    if (!(state = xkb_state_new(keymap))) goto unmap;
-
-    compose_table = xkb_compose_table_new_from_locale(
-        context, keyboard_locale(), XKB_COMPOSE_COMPILE_NO_FLAGS);
-    if (compose_table)
-        compose_state = xkb_compose_state_new(
-            compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
-
-    destroy_keyboard_state(surface);
-    surface->xkb_context = context;
-    surface->xkb_keymap = keymap;
-    surface->xkb_state = state;
-    surface->xkb_compose_table = compose_table;
-    surface->xkb_compose_state = compose_state;
-    context = NULL;
-    keymap = NULL;
-    state = NULL;
-    compose_table = NULL;
-    compose_state = NULL;
-    overlay_trace("loaded Wayland keyboard map for overlay text input");
-
-unmap:
-    if (compose_state) xkb_compose_state_unref(compose_state);
-    if (compose_table) xkb_compose_table_unref(compose_table);
-    if (state) xkb_state_unref(state);
-    if (keymap) xkb_keymap_unref(keymap);
-    if (context) xkb_context_unref(context);
-    munmap(map, size);
-done:
+    (void)format;
+    (void)size;
     close(fd);
-}
-
-static uint32_t keyboard_get_utf32(struct ge_overlay_wayland_surface *surface,
-                                   uint32_t key)
-{
-    enum xkb_compose_status status;
-    xkb_keysym_t keysym;
-    uint32_t utf32;
-
-    if (!surface->xkb_state) return 0;
-
-    keysym = xkb_state_key_get_one_sym(surface->xkb_state, key + 8);
-    if (!surface->xkb_compose_state || keysym == XKB_KEY_NoSymbol)
-        return xkb_state_key_get_utf32(surface->xkb_state, key + 8);
-
-    xkb_compose_state_feed(surface->xkb_compose_state, keysym);
-    status = xkb_compose_state_get_status(surface->xkb_compose_state);
-    if (status == XKB_COMPOSE_COMPOSED)
-    {
-        utf32 = xkb_keysym_to_utf32(
-            xkb_compose_state_get_one_sym(surface->xkb_compose_state));
-        xkb_compose_state_reset(surface->xkb_compose_state);
-        return utf32;
-    }
-    if (status == XKB_COMPOSE_CANCELLED)
-    {
-        xkb_compose_state_reset(surface->xkb_compose_state);
-        return 0;
-    }
-    if (status == XKB_COMPOSE_COMPOSING) return 0;
-
-    return xkb_state_key_get_utf32(surface->xkb_state, key + 8);
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard,
@@ -453,7 +713,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard,
     {
         if (*key >= sizeof(surface->keys) || surface->keys[*key]) continue;
         surface->keys[*key] = 1;
-        ge_overlay_bridge_filter_key(0, *key, 1, 0);
+        ge_overlay_bridge_filter_key(0, *key, 1);
     }
     update_bridge_focus(surface);
     overlay_trace("Wayland toplevel gained keyboard focus");
@@ -467,7 +727,7 @@ static void release_pressed_keys(struct ge_overlay_wayland_surface *surface)
     {
         if (!surface->keys[key]) continue;
         surface->keys[key] = 0;
-        ge_overlay_bridge_filter_key(0, key, 0, 0);
+        ge_overlay_bridge_filter_key(0, key, 0);
     }
 }
 
@@ -495,14 +755,12 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
 {
     struct ge_overlay_wayland_surface *surface = data;
     int pressed = state == WL_KEYBOARD_KEY_STATE_PRESSED;
-    uint32_t utf32 = 0;
 
     (void)keyboard;
     (void)serial;
     if (!surface->keyboard_focus) return;
     if (key < sizeof(surface->keys)) surface->keys[key] = pressed;
-    if (pressed) utf32 = keyboard_get_utf32(surface, key);
-    ge_overlay_bridge_filter_key(time, key, pressed, utf32);
+    ge_overlay_bridge_filter_key(time, key, pressed);
 }
 
 static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
@@ -510,13 +768,13 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard,
                                uint32_t latched, uint32_t locked,
                                uint32_t group)
 {
-    struct ge_overlay_wayland_surface *surface = data;
-
+    (void)data;
     (void)keyboard;
     (void)serial;
-    if (surface->xkb_state)
-        xkb_state_update_mask(surface->xkb_state, depressed, latched, locked,
-                              0, 0, group);
+    (void)depressed;
+    (void)latched;
+    (void)locked;
+    (void)group;
 }
 
 static void keyboard_repeat_info(void *data, struct wl_keyboard *keyboard,
@@ -550,12 +808,13 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
     surface->pointer_surface = wl_surface;
     surface->pointer_focus = 1;
     surface->pointer_serial = serial;
+    surface->on_catcher = wl_surface == surface->catcher_surface;
     surface->pointer_x = wl_fixed_to_int(x);
     surface->pointer_y = wl_fixed_to_int(y);
     surface->relative_motion_seen = 0;
     surface->frame.time = 0;
-    surface->frame.x = surface->pointer_x;
-    surface->frame.y = surface->pointer_y;
+    pointer_to_steam(surface, wl_fixed_to_double(x), wl_fixed_to_double(y),
+                     &surface->frame.x, &surface->frame.y);
     surface->frame.flags |= GE_STEAM_OVERLAY_FRAME_ABSOLUTE;
 
     pthread_mutex_lock(&focused_pointer_mutex);
@@ -585,6 +844,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     pthread_mutex_unlock(&focused_pointer_mutex);
     surface->pointer_surface = NULL;
     surface->pointer_focus = 0;
+    surface->on_catcher = 0;
     surface->pointer_serial = 0;
     surface->relative_motion_seen = 0;
     memset(&surface->frame, 0, sizeof(surface->frame));
@@ -603,8 +863,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
     surface->pointer_x = wl_fixed_to_int(x);
     surface->pointer_y = wl_fixed_to_int(y);
     surface->frame.time = time;
-    surface->frame.x = surface->pointer_x;
-    surface->frame.y = surface->pointer_y;
+    pointer_to_steam(surface, wl_fixed_to_double(x), wl_fixed_to_double(y),
+                     &surface->frame.x, &surface->frame.y);
     surface->frame.flags |= GE_STEAM_OVERLAY_FRAME_ABSOLUTE;
 }
 
@@ -714,7 +974,9 @@ static void relative_pointer_motion(
     (void)dx_unaccel;
     (void)dy_unaccel;
 
-    if (!surface->pointer_focus) return;
+    /* The input catcher gives the overlay absolute positions that are not
+     * affected by the game's pointer constraint. */
+    if (!surface->pointer_focus || surface->on_catcher) return;
 
     frame.time = (uint32_t)(usec / 1000);
 
@@ -732,6 +994,13 @@ static void relative_pointer_motion(
 
     frame.dx = wl_fixed_to_double(dx);
     frame.dy = wl_fixed_to_double(dy);
+    /* Deltas are in compositor units; Steam hit-tests in swapchain pixels. */
+    if (swapchain_width > 0 && swapchain_height > 0 &&
+        surface->catcher_width > 0 && surface->catcher_height > 0)
+    {
+        frame.dx = frame.dx * swapchain_width / surface->catcher_width;
+        frame.dy = frame.dy * swapchain_height / surface->catcher_height;
+    }
     frame.flags = GE_STEAM_OVERLAY_FRAME_RELATIVE;
     ge_overlay_bridge_filter_pointer_frame(&frame);
 }
@@ -778,6 +1047,7 @@ static void destroy_seat_devices(struct ge_overlay_wayland_surface *surface)
     }
     pthread_mutex_lock(&focused_pointer_mutex);
     if (focused_pointer == surface) focused_pointer = NULL;
+    destroy_input_catcher_locked(surface);
     destroy_overlay_cursor(surface);
     pthread_mutex_unlock(&focused_pointer_mutex);
 
@@ -801,7 +1071,6 @@ static void destroy_seat_devices(struct ge_overlay_wayland_surface *surface)
         wl_seat_release(surface->seat);
         surface->seat = NULL;
     }
-    destroy_keyboard_state(surface);
     surface->seat_name = 0;
 }
 
@@ -821,7 +1090,6 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
         surface->keyboard_focus = 0;
         wl_keyboard_release(surface->keyboard);
         surface->keyboard = NULL;
-        destroy_keyboard_state(surface);
         update_bridge_focus(surface);
     }
 
@@ -893,6 +1161,44 @@ static void registry_global(void *data, struct wl_registry *registry,
         wl_proxy_set_queue((struct wl_proxy *)surface->seat, surface->queue);
         wl_seat_add_listener(surface->seat, &seat_listener, surface);
     }
+    else if (!strcmp(interface, wp_viewporter_interface.name) &&
+             !surface->viewporter)
+    {
+        surface->viewporter = wl_registry_bind(
+            registry, name, &wp_viewporter_interface, 1);
+        wl_proxy_set_queue((struct wl_proxy *)surface->viewporter,
+                           surface->queue);
+    }
+    else if (!strcmp(interface, zxdg_output_manager_v1_interface.name) &&
+             !surface->xdg_output_manager)
+    {
+        surface->xdg_output_manager_name = name;
+        surface->xdg_output_manager = wl_registry_bind(
+            registry, name, &zxdg_output_manager_v1_interface, 1);
+        wl_proxy_set_queue((struct wl_proxy *)surface->xdg_output_manager,
+                           surface->queue);
+        attach_xdg_outputs(surface);
+    }
+    else if (!strcmp(interface, wl_output_interface.name))
+    {
+        int i;
+
+        for (i = 0; i < GE_MAX_OUTPUTS; ++i)
+        {
+            struct overlay_output *output = &surface->outputs[i];
+
+            if (output->output) continue;
+            output->name = name;
+            output->scale = 1;
+            output->output = wl_registry_bind(
+                registry, name, &wl_output_interface, version < 2 ? version : 2);
+            wl_proxy_set_queue((struct wl_proxy *)output->output,
+                               surface->queue);
+            wl_output_add_listener(output->output, &output_listener, output);
+            attach_xdg_outputs(surface);
+            break;
+        }
+    }
     else if (!strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) &&
              !surface->relative_pointer_manager)
     {
@@ -912,6 +1218,17 @@ static void registry_global_remove(void *data, struct wl_registry *registry,
 
     (void)registry;
     if (surface->seat_name == name) destroy_seat_devices(surface);
+    {
+        int i;
+
+        for (i = 0; i < GE_MAX_OUTPUTS; ++i)
+            if (surface->outputs[i].output && surface->outputs[i].name == name)
+            {
+                pthread_mutex_lock(&focused_pointer_mutex);
+                destroy_output(surface, &surface->outputs[i]);
+                pthread_mutex_unlock(&focused_pointer_mutex);
+            }
+    }
     if (surface->subcompositor_name == name)
     {
         destroy_overlay_cursor(surface);
@@ -983,6 +1300,9 @@ struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_create(
     ge_overlay_bridge_surface_created();
     surface->bridge_registered = 1;
     process_input_surface = surface;
+    pthread_mutex_lock(&focused_pointer_mutex);
+    active_input = surface;
+    pthread_mutex_unlock(&focused_pointer_mutex);
     pthread_mutex_unlock(&input_surface_mutex);
     overlay_trace("attached input listeners to process Wayland connection");
     return surface;
@@ -999,6 +1319,10 @@ fail:
     if (surface->compositor) wl_compositor_destroy(surface->compositor);
     if (surface->subcompositor)
         wl_subcompositor_destroy(surface->subcompositor);
+    destroy_outputs(surface);
+    if (surface->xdg_output_manager)
+        zxdg_output_manager_v1_destroy(surface->xdg_output_manager);
+    if (surface->viewporter) wp_viewporter_destroy(surface->viewporter);
     if (surface->registry) wl_registry_destroy(surface->registry);
     if (surface->queue) wl_event_queue_destroy(surface->queue);
     free(surface);
@@ -1009,8 +1333,23 @@ fail:
 void ge_overlay_wayland_surface_dispatch(struct ge_overlay_wayland_surface *surface)
 {
     if (!surface || !surface->display || !surface->queue) return;
+
+    pthread_mutex_lock(&input_dispatch_mutex);
     if (wl_display_dispatch_queue_pending(surface->display, surface->queue) < 0)
         overlay_trace("failed to dispatch private Wayland input queue");
+    pthread_mutex_unlock(&input_dispatch_mutex);
+}
+
+struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_ref(
+    struct ge_overlay_wayland_surface *surface)
+{
+    pthread_mutex_lock(&input_surface_mutex);
+    if (surface != process_input_surface || !surface->refs)
+        surface = NULL;
+    else
+        ++surface->refs;
+    pthread_mutex_unlock(&input_surface_mutex);
+    return surface;
 }
 
 void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface)
@@ -1031,6 +1370,9 @@ void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surfa
     process_input_surface = NULL;
     pthread_mutex_unlock(&input_surface_mutex);
 
+    pthread_mutex_lock(&focused_pointer_mutex);
+    if (active_input == surface) active_input = NULL;
+    pthread_mutex_unlock(&focused_pointer_mutex);
     destroy_seat_devices(surface);
     if (surface->relative_pointer_manager)
         zwp_relative_pointer_manager_v1_destroy(
@@ -1042,6 +1384,10 @@ void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surfa
     if (surface->compositor) wl_compositor_destroy(surface->compositor);
     if (surface->subcompositor)
         wl_subcompositor_destroy(surface->subcompositor);
+    destroy_outputs(surface);
+    if (surface->xdg_output_manager)
+        zxdg_output_manager_v1_destroy(surface->xdg_output_manager);
+    if (surface->viewporter) wp_viewporter_destroy(surface->viewporter);
     if (surface->registry) wl_registry_destroy(surface->registry);
     if (surface->queue) wl_event_queue_destroy(surface->queue);
     if (surface->bridge_registered) ge_overlay_bridge_surface_destroyed();

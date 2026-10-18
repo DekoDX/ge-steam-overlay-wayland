@@ -57,17 +57,22 @@ void ge_overlay_focus_proxy_instance_destroyed(void);
 
 struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_create(
     struct wl_display *display, struct wl_surface *surface);
+struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_ref(
+    struct ge_overlay_wayland_surface *surface);
 void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface);
 void ge_overlay_wayland_surface_dispatch(struct ge_overlay_wayland_surface *surface);
 void ge_overlay_wayland_set_cursor_shape(uint32_t shape);
 void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y);
 void ge_overlay_wayland_set_overlay_active(int active);
+/* Drops the game's SDL keyboard/mouse events while the overlay owns input. */
+void ge_overlay_game_input_gate(int block);
+void ge_overlay_wayland_set_swapchain_extent(int32_t width, int32_t height);
 
 void ge_overlay_bridge_surface_created(void);
 void ge_overlay_bridge_surface_destroyed(void);
 void ge_overlay_bridge_focus(int focused);
-int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed,
-                                 uint32_t utf32);
+int ge_overlay_bridge_get_xlib_proxy(void **display, unsigned long *window);
+int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed);
 int ge_overlay_bridge_filter_pointer_button(uint32_t time, uint32_t button,
                                             int pressed);
 int ge_overlay_bridge_filter_pointer_frame(
